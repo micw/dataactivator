@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..providers.vw.const import NO_CONTENT_SUFFIX
-from ..providers.vw.datasets import parse_timestamp
+from ..providers.vw.datasets import dataset_captures, parse_timestamp
 from .events import Event
 
 NOMINAL_INTERVAL = timedelta(minutes=15)
@@ -169,6 +169,32 @@ class SeriesCompleteness:
 
 
 @dataclass
+class Freshness:
+    """How stale the delivered data actually is.
+
+    VW re-publishes the same in-vehicle snapshot every 15 min while the
+    car is offline, so a file arriving on time can still carry hours-old
+    data. ``capture_lag`` = publish time − newest in-vehicle capture;
+    ``frozen`` = stretches where the capture time did not advance across
+    consecutive publishes (VW shipping unchanged snapshots).
+    """
+
+    capture_lags_seconds: list[float] = field(default_factory=list)
+    datasets_total: int = 0
+    longest_frozen_seconds: float = 0.0
+    total_frozen_seconds: float = 0.0
+    frozen_spans: int = 0
+
+    @property
+    def median_lag_seconds(self) -> float | None:
+        return statistics.median(self.capture_lags_seconds) if self.capture_lags_seconds else None
+
+    @property
+    def max_lag_seconds(self) -> float | None:
+        return max(self.capture_lags_seconds) if self.capture_lags_seconds else None
+
+
+@dataclass
 class Report:
     account: str
     observation_start: datetime | None
@@ -177,6 +203,7 @@ class Report:
     outages: list[Outage]
     zips: ZipAvailability
     series: SeriesCompleteness
+    freshness: Freshness = field(default_factory=Freshness)
 
     @property
     def overall_availability_pct(self) -> float:
@@ -199,6 +226,7 @@ def build_report(
     # observation; backlog already offered at the first poll would yield a
     # bogus delay measured from log start.
     series = _series_completeness(events, obs_start)
+    freshness = _freshness(data_root)
 
     return Report(
         account=account,
@@ -208,7 +236,55 @@ def build_report(
         outages=outages,
         zips=zips,
         series=series,
+        freshness=freshness,
     )
+
+
+def _freshness(data_root: Path | None) -> Freshness:
+    """Capture-lag and frozen-data analysis from the stored ZIPs.
+
+    Reads each content dataset's newest in-vehicle capture time (the real
+    freshness), independent of the punctual publish cadence.
+    """
+    fr = Freshness()
+    if data_root is None or not data_root.exists():
+        return fr
+
+    captures: list[tuple[datetime, datetime | None]] = []
+    for vin_dir in sorted(d for d in data_root.iterdir() if d.is_dir()):
+        captures.extend(dataset_captures(vin_dir))
+    captures.sort(key=lambda c: c[0])
+    fr.datasets_total = len(captures)
+
+    for publish, captured in captures:
+        if captured is not None:
+            fr.capture_lags_seconds.append(max((publish - captured).total_seconds(), 0.0))
+
+    # Frozen stretches: consecutive publishes during which the newest
+    # capture never advanced (VW re-shipping an unchanged snapshot).
+    threshold = NOMINAL_INTERVAL * 2
+    seen_max: datetime | None = None
+    frozen_start: datetime | None = None
+    prev_publish: datetime | None = None
+    spans: list[tuple[datetime, datetime]] = []
+    for publish, captured in captures:
+        advanced = captured is not None and (seen_max is None or captured > seen_max)
+        if advanced:
+            seen_max = captured
+            if frozen_start is not None:
+                spans.append((frozen_start, prev_publish))
+                frozen_start = None
+        elif frozen_start is None and prev_publish is not None:
+            frozen_start = prev_publish
+        prev_publish = publish
+    if frozen_start is not None and prev_publish is not None:
+        spans.append((frozen_start, prev_publish))
+
+    durations = [(b - a).total_seconds() for a, b in spans if b - a > threshold]
+    fr.frozen_spans = len(durations)
+    fr.total_frozen_seconds = sum(durations)
+    fr.longest_frozen_seconds = max(durations) if durations else 0.0
+    return fr
 
 
 def _availability(events: list[Event]) -> tuple[dict[str, EndpointAvailability], list[Outage]]:
@@ -548,6 +624,14 @@ def to_dict(r: Report) -> dict:
                 for g in r.series.gaps
             ],
         },
+        "freshness": {
+            "datasets_total": r.freshness.datasets_total,
+            "median_capture_lag_seconds": _round_opt(r.freshness.median_lag_seconds),
+            "max_capture_lag_seconds": _round_opt(r.freshness.max_lag_seconds),
+            "frozen_spans": r.freshness.frozen_spans,
+            "longest_frozen_seconds": round(r.freshness.longest_frozen_seconds, 1),
+            "total_frozen_seconds": round(r.freshness.total_frozen_seconds, 1),
+        },
     }
 
 
@@ -615,6 +699,22 @@ def render_markdown(r: Report) -> str:
         lines += ["", "### Zurechenbarkeit der fehlenden Werte"]
         for cause, count in sorted(s.cause_counts.items()):
             lines.append(f"- {cause_label(cause)}: {count}")
+
+    fr = r.freshness
+    lines += ["", "## Datenfrische"]
+    if fr.median_lag_seconds is not None:
+        lines.append(
+            f"- Erfassungs-Lag (Publish − Fahrzeug-Erfassung): "
+            f"Median {fr.median_lag_seconds/3600:.1f} h, Max {fr.max_lag_seconds/3600:.1f} h"
+        )
+    else:
+        lines.append("- Erfassungs-Lag: keine Erfassungszeiten gefunden")
+    lines.append(
+        f"- Eingefrorene Daten: {fr.frozen_spans} Phasen, "
+        f"längste {fr.longest_frozen_seconds/3600:.1f} h, "
+        f"gesamt {fr.total_frozen_seconds/3600:.1f} h "
+        f"(VW re-publiziert unveränderte Snapshots)"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -698,6 +798,23 @@ def render_html(r: Report) -> str:
         out.append("</ul>")
     else:
         out.append("<p class=muted>keine Lücken</p>")
+    out.append("</section>")
+
+    fr = r.freshness
+    out.append("<section><h2>Datenfrische</h2>")
+    if fr.median_lag_seconds is not None:
+        out.append(
+            f"<p class='big {_pct_class(0)}'>Median {fr.median_lag_seconds/3600:.1f} h "
+            f"alt</p><p>Erfassungs-Lag zwischen Messung im Fahrzeug und "
+            f"Bereitstellung · Max {fr.max_lag_seconds/3600:.1f} h</p>")
+    else:
+        out.append("<p class=muted>keine Erfassungszeiten gefunden</p>")
+    if fr.frozen_spans:
+        out.append(
+            f"<p>Eingefrorene Daten: {fr.frozen_spans} Phasen, längste "
+            f"{fr.longest_frozen_seconds/3600:.1f} h, gesamt "
+            f"{fr.total_frozen_seconds/3600:.1f} h — unveränderte Snapshots "
+            f"trotz laufender Publish-Kadenz</p>")
     out.append("</section>")
 
     out.append("<p class=sub><a href='./'>&larr; Übersicht</a></p>")

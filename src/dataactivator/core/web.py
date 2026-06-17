@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from ..providers.vw.datasets import load_latest
+from ..providers.vw.datasets import latest_state
 from .config import AppConfig
 from .events import read_events
 from .reporting import Report, build_report, render_html, to_dict
@@ -102,37 +102,44 @@ class WebApp:
         for p in self.config.providers:
             folder = self.config.storage.folder.expanduser() / p.name
             for vin_dir in sorted(d for d in folder.glob("*") if d.is_dir()):
-                latest = load_latest(vin_dir)
-                stamp = _fmt(latest[0]) if latest else "—"
+                state = latest_state(vin_dir)
+                stand = _fmt(state[1]) + f" ({_age(state[1])})" if state and state[1] \
+                    else "—"
                 rows.append(
                     f"<tr><td><a href='data/{html.escape(p.name)}/"
                     f"{html.escape(vin_dir.name)}'>{html.escape(vin_dir.name)}</a></td>"
-                    f"<td>{html.escape(p.name)}</td><td>{stamp}</td></tr>"
+                    f"<td>{html.escape(p.name)}</td><td>{stand}</td></tr>"
                 )
         body = "".join(rows) or "<tr><td colspan=3>noch keine Daten</td></tr>"
         return _page("Fahrzeugdaten",
                      "<h1>Fahrzeugdaten</h1>"
-                     "<table><tr><th>VIN</th><th>Account</th><th>Stand</th></tr>"
+                     "<table><tr><th>VIN</th><th>Account</th>"
+                     "<th>Stand (Fahrzeug-Erfassung)</th></tr>"
                      + body + "</table><p><a href='../'>&larr; Übersicht</a></p>")
 
     def _vehicle_data(self, account: str, vin: str) -> str:
         folder = self.config.storage.folder.expanduser() / account / vin
-        latest = load_latest(folder)
-        if latest is None:
+        state = latest_state(folder)
+        if state is None:
             return _page("Fahrzeugdaten", f"<h1>{html.escape(vin)}</h1>"
                          "<p>keine Daten</p><p><a href='../../data'>&larr; zurück</a></p>")
-        timestamp, points = latest
-        age_min = (datetime.now(timezone.utc) - timestamp).total_seconds() / 60
+        publish_ts, captured, fields = state
         rows = "".join(
-            f"<tr><td>{html.escape(str(p.get('dataFieldName', '')))}</td>"
-            f"<td>{html.escape(str(p.get('value', '')))}</td></tr>"
-            for p in sorted(points, key=lambda d: str(d.get("dataFieldName", "")))
+            f"<tr><td>{html.escape(name)}</td><td>{html.escape(str(value))}</td></tr>"
+            for name, value in sorted(fields.items())
         )
+        # The capture time is the real freshness; the file/publish time only
+        # says when VW re-packaged the (often stale) snapshot.
+        if captured is not None:
+            stand = (f"<p class='big'>Stand: {_fmt(captured)} "
+                     f"<span class=age>({_age(captured)})</span></p>")
+        else:
+            stand = "<p class=sub>keine Erfassungszeit im Datensatz</p>"
         return _page(
             f"{vin}",
-            f"<h1>{html.escape(vin)}</h1>"
-            f"<p class=sub>Stand {_fmt(timestamp)} (vor {age_min:.0f} min) · "
-            f"{len(points)} Werte</p>"
+            f"<h1>{html.escape(vin)}</h1>" + stand +
+            f"<p class=sub>Datei publiziert {_fmt(publish_ts)} · {len(fields)} Werte "
+            "(Report-Metadaten ausgeblendet)</p>"
             "<table><tr><th>Feld</th><th>Wert</th></tr>" + rows + "</table>"
             "<p><a href='../../data'>&larr; zurück</a></p>")
 
@@ -172,12 +179,23 @@ def _page(title: str, inner: str) -> str:
         "margin:2rem auto;padding:0 1rem}table{border-collapse:collapse;"
         "width:100%}th,td{text-align:left;padding:.35rem .6rem;"
         "border-bottom:1px solid #eee}a{color:#0969da}.sub{color:#666}"
+        ".big{font-size:1.2rem;font-weight:600}.age{color:#bf8700;font-weight:400}"
         "</style></head><body>" + inner + "</body></html>"
     )
 
 
 def _fmt(dt: datetime) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _age(dt: datetime) -> str:
+    minutes = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+    if minutes < 90:
+        return f"vor {minutes:.0f} min"
+    hours = minutes / 60
+    if hours < 36:
+        return f"vor {hours:.1f} h"
+    return f"vor {hours / 24:.1f} Tagen"
 
 
 def _check_basic(auth_header: str | None, user: str, password: str) -> bool:
