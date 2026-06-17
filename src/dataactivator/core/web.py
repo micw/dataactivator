@@ -12,12 +12,17 @@ addition; neither lives here.
 
 from __future__ import annotations
 
+import base64
+import hmac
+import html
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ..providers.vw.datasets import load_latest
 from .config import AppConfig
 from .events import read_events
 from .reporting import Report, build_report, render_html, to_dict
@@ -44,13 +49,20 @@ class WebApp:
         self._cache[name] = (time.monotonic(), report)
         return report
 
-    def respond(self, path: str) -> tuple[int, str, bytes]:
-        """Return (status, content_type, body) for a request path."""
+    def respond(
+        self, path: str, auth_header: str | None = None
+    ) -> tuple[int, str, bytes, dict[str, str]]:
+        """Return (status, content_type, body, extra_headers) for a path."""
         path = path.split("?", 1)[0]
         names = {p.name for p in self.config.providers}
 
         if path in ("", "/"):
             return self._ok("text/html; charset=utf-8", self._index())
+
+        # Internal vehicle-data pages — only active when a password is set,
+        # then gated by HTTP Basic auth.
+        if path == "/data" or path.startswith("/data/"):
+            return self._data(path, auth_header)
 
         target = path.lstrip("/")
         as_json = target.endswith(".json")
@@ -63,11 +75,68 @@ class WebApp:
                 return self._ok("application/json; charset=utf-8", body)
             return self._ok("text/html; charset=utf-8", render_html(report))
 
-        return (404, "text/plain; charset=utf-8", b"not found\n")
+        return self._not_found()
+
+    # -- internal vehicle-data pages --------------------------------------
+
+    def _data(self, path: str, auth_header: str | None) -> tuple[int, str, bytes, dict]:
+        web = self.config.web
+        if not web.data_enabled:
+            return self._not_found()
+        if not _check_basic(auth_header, web.data_username, web.data_password):
+            return (401, "text/plain; charset=utf-8", b"authentication required\n",
+                    {"WWW-Authenticate": 'Basic realm="dataactivator"'})
+
+        names = {p.name for p in self.config.providers}
+        sub = path[len("/data"):].strip("/")
+        if sub == "":
+            return self._ok("text/html; charset=utf-8", self._vehicle_index())
+        parts = sub.split("/")
+        if len(parts) == 2 and parts[0] in names:
+            return self._ok("text/html; charset=utf-8",
+                            self._vehicle_data(parts[0], parts[1]))
+        return self._not_found()
+
+    def _vehicle_index(self) -> str:
+        rows = []
+        for p in self.config.providers:
+            folder = self.config.storage.folder.expanduser() / p.name
+            for vin_dir in sorted(d for d in folder.glob("*") if d.is_dir()):
+                latest = load_latest(vin_dir)
+                stamp = _fmt(latest[0]) if latest else "—"
+                rows.append(
+                    f"<tr><td><a href='data/{html.escape(p.name)}/"
+                    f"{html.escape(vin_dir.name)}'>{html.escape(vin_dir.name)}</a></td>"
+                    f"<td>{html.escape(p.name)}</td><td>{stamp}</td></tr>"
+                )
+        body = "".join(rows) or "<tr><td colspan=3>noch keine Daten</td></tr>"
+        return _page("Fahrzeugdaten",
+                     "<h1>Fahrzeugdaten</h1>"
+                     "<table><tr><th>VIN</th><th>Account</th><th>Stand</th></tr>"
+                     + body + "</table><p><a href='../'>&larr; Übersicht</a></p>")
+
+    def _vehicle_data(self, account: str, vin: str) -> str:
+        folder = self.config.storage.folder.expanduser() / account / vin
+        latest = load_latest(folder)
+        if latest is None:
+            return _page("Fahrzeugdaten", f"<h1>{html.escape(vin)}</h1>"
+                         "<p>keine Daten</p><p><a href='../../data'>&larr; zurück</a></p>")
+        timestamp, points = latest
+        age_min = (datetime.now(timezone.utc) - timestamp).total_seconds() / 60
+        rows = "".join(
+            f"<tr><td>{html.escape(str(p.get('dataFieldName', '')))}</td>"
+            f"<td>{html.escape(str(p.get('value', '')))}</td></tr>"
+            for p in sorted(points, key=lambda d: str(d.get("dataFieldName", "")))
+        )
+        return _page(
+            f"{vin}",
+            f"<h1>{html.escape(vin)}</h1>"
+            f"<p class=sub>Stand {_fmt(timestamp)} (vor {age_min:.0f} min) · "
+            f"{len(points)} Werte</p>"
+            "<table><tr><th>Feld</th><th>Wert</th></tr>" + rows + "</table>"
+            "<p><a href='../../data'>&larr; zurück</a></p>")
 
     def _index(self) -> str:
-        import html
-
         rows = []
         for p in self.config.providers:
             r = self.report(p.name)
@@ -76,22 +145,52 @@ class WebApp:
                 f"<td>{r.overall_availability_pct:.1f} %</td>"
                 f"<td>{r.series.completeness_pct:.1f} %</td></tr>"
             )
-        return (
-            "<!doctype html><html lang=de><head><meta charset=utf-8>"
-            "<meta name=viewport content='width=device-width, initial-scale=1'>"
-            "<title>dataACTivator — Übersicht</title>"
-            "<style>body{font-family:system-ui,sans-serif;max-width:48rem;"
-            "margin:2rem auto;padding:0 1rem}table{border-collapse:collapse;"
-            "width:100%}th,td{text-align:left;padding:.4rem .6rem;"
-            "border-bottom:1px solid #eee}a{color:#0969da}</style></head><body>"
-            "<h1>dataACTivator</h1><p>EU-Data-Act-Compliance je Fahrzeug-Account.</p>"
+        data_link = ("<p><a href='data'>→ Fahrzeugdaten (intern, geschützt)</a></p>"
+                     if self.config.web.data_enabled else "")
+        return _page(
+            "Übersicht",
+            "<h1>dataACTivator</h1>"
+            "<p>EU-Data-Act-Compliance je Fahrzeug-Account.</p>"
             "<table><tr><th>Account</th><th>Portal-Verfügbarkeit</th>"
-            "<th>Vollständigkeit</th></tr>" + "".join(rows) + "</table></body></html>"
-        )
+            "<th>Vollständigkeit</th></tr>" + "".join(rows) + "</table>" + data_link)
 
     @staticmethod
-    def _ok(content_type: str, body: str) -> tuple[int, str, bytes]:
-        return (200, content_type, body.encode("utf-8"))
+    def _ok(content_type: str, body: str) -> tuple[int, str, bytes, dict]:
+        return (200, content_type, body.encode("utf-8"), {})
+
+    @staticmethod
+    def _not_found() -> tuple[int, str, bytes, dict]:
+        return (404, "text/plain; charset=utf-8", b"not found\n", {})
+
+
+def _page(title: str, inner: str) -> str:
+    return (
+        "<!doctype html><html lang=de><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width, initial-scale=1'>"
+        f"<title>dataACTivator — {html.escape(title)}</title>"
+        "<style>body{font-family:system-ui,sans-serif;max-width:52rem;"
+        "margin:2rem auto;padding:0 1rem}table{border-collapse:collapse;"
+        "width:100%}th,td{text-align:left;padding:.35rem .6rem;"
+        "border-bottom:1px solid #eee}a{color:#0969da}.sub{color:#666}"
+        "</style></head><body>" + inner + "</body></html>"
+    )
+
+
+def _fmt(dt: datetime) -> str:
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _check_basic(auth_header: str | None, user: str, password: str) -> bool:
+    if not auth_header or not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    got_user, _, got_pass = decoded.partition(":")
+    # Constant-time compare on both fields.
+    return (hmac.compare_digest(got_user, user)
+            and hmac.compare_digest(got_pass, password))
 
 
 def _public_dict(report: Report) -> dict:
@@ -107,10 +206,13 @@ def make_server(config: AppConfig) -> ThreadingHTTPServer:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            status, content_type, body = app.respond(self.path)
+            status, content_type, body, extra = app.respond(
+                self.path, self.headers.get("Authorization"))
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for key, value in extra.items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 

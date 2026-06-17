@@ -71,6 +71,32 @@ def parse_timestamp(name: str) -> datetime:
     return datetime.strptime(stamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
 
 
+def load_latest(vin_dir: Path) -> tuple[datetime, list[dict]] | None:
+    """Newest dataset's (timestamp, data points) for a vehicle, or None.
+
+    Data points are ``{key, dataFieldName, value}`` dicts. Empty-window
+    markers are skipped.
+    """
+    zips = sorted(
+        p for p in vin_dir.glob("*.zip")
+        if not p.name.endswith(const.NO_CONTENT_SUFFIX)
+    )
+    if not zips:
+        return None
+    path = zips[-1]
+    try:
+        timestamp = parse_timestamp(path.name)
+        with zipfile.ZipFile(path) as zf:
+            members = [n for n in zf.namelist() if n.lower().endswith(".json")]
+            if not members:
+                return None
+            payload = json.loads(zf.read(members[0]))
+    except (ValueError, OSError, zipfile.BadZipFile):
+        return None
+    points = [p for p in payload.get("Data", []) if isinstance(p, dict)]
+    return timestamp, points
+
+
 def read_dataset(path: Path) -> DatasetFile:
     """Open, validate and summarise one dataset ZIP."""
     name = path.name

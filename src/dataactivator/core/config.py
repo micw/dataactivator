@@ -72,13 +72,24 @@ class StorageConfig(BaseModel):
 
 
 class WebConfig(BaseModel):
-    """Public statistics web server (served in ``serve`` mode)."""
+    """Web server (served in ``serve`` mode).
+
+    The public statistics pages are always on. The internal vehicle-data
+    pages are only active when ``data_password`` is set — they show real
+    telemetry (and the VIN) and are protected by HTTP Basic auth.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
     host: str = "0.0.0.0"
     port: int = 8080
+    data_username: str = "admin"
+    data_password: str = ""
+
+    @property
+    def data_enabled(self) -> bool:
+        return bool(self.data_password)
 
 
 class AppConfig(BaseModel):

@@ -3,6 +3,16 @@ storage:
   type: file
   folder: data       # datasets + event log live under <folder>/<provider>/
 
+# Web server started by `serve`. One port serves the public statistics
+# pages (/, /<account>) and — only when data_password is set — the
+# internal vehicle-data pages (/data) protected by HTTP Basic auth.
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
+  # data_username: admin       # Basic-auth user for the internal /data pages
+  # data_password: changeme    # set to enable the internal vehicle-data pages
+
 providers:
   - name: vw
     type: volkswagen-data-act-portal
