@@ -88,18 +88,20 @@ def test_zip_present_locally_counts_as_retrieved(tmp_path) -> None:
 
 
 def test_gap_attributed_data_missing_when_portal_up() -> None:
-    # values at min 0 and 45 (a 45-min gap = ~2 missing); portal answered
-    # 200 during the gap -> DATA_MISSING.
+    # Values at min 0 and 45 (a 45-min gap = 2 missing slots at min 15/30);
+    # the portal answered 200 near *both* missing slots -> DATA_MISSING.
     events = [
         ev(0, "data_request", vin=VIN, identifier="i", start_date=at(0), frequency="15mins"),
         offered(0, [(0, False)]),
-        ev(20, "portal_response", endpoint="list", status=200),
+        ev(15, "portal_response", endpoint="list", status=200),
+        ev(30, "portal_response", endpoint="list", status=200),
         offered(45, [(45, False)]),
     ]
     r = build_report("acc", events)
     assert len(r.series.gaps) == 1
     assert r.series.gaps[0].cause == DATA_MISSING
     assert r.series.gaps[0].estimated_missing == 2
+    assert r.series.cause_counts == {DATA_MISSING: 2}
 
 
 def test_gap_attributed_portal_outage() -> None:
@@ -158,6 +160,7 @@ def test_delivery_delay_end_to_end_and_publish_lag() -> None:
     name = ds_name(0)
     events = [
         ev(0, "data_request", vin=VIN, identifier="i", start_date=at(0)),
+        ev(5, "portal_response", endpoint="list", status=200),  # we were watching
         ev(5, "datasets_offered", vin=VIN, datasets=[
             {"name": name, "createdOn": at(1), "size": "100", "no_content": False}]),
         ev(6, "dataset_downloaded", name=name, sha256="a" * 64, bytes=10, no_content=False),

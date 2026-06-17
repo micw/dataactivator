@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from .core.locks import FileLock, account_lock
 from .core.reporting import build_report, render_markdown, to_dict
 from .core.scheduler import PollTarget, Scheduler
 from .core.sessions import SessionStore
+from .core.web import make_server as make_web_server
 from .providers.vw import PROVIDER_TYPE as VW_TYPE
 from .providers.vw.client import VwApiError, VwAuthError, VwPortalClient, VwSettings
 from .providers.vw.datasets import check_directory
@@ -309,9 +311,20 @@ def _cmd_serve(config: AppConfig) -> int:
     interval = targets[0].client.settings.poll_interval
     print(f"serving: watching {len(targets)} provider(s) "
           f"({', '.join(t.name for t in targets)}) every {interval:.0f}s")
-    # TODO: start web server thread here (health, metrics, report) before
-    # entering the blocking loop.
-    _run_watch_loop(targets)
+
+    # Public statistics server runs alongside the (blocking) watch loop.
+    # (Management port for health/metrics and the authenticated evcc data
+    # endpoint are separate, later additions.)
+    web_server = None
+    if config.web.enabled:
+        web_server = make_web_server(config)
+        threading.Thread(target=web_server.serve_forever, daemon=True).start()
+        print(f"public stats on http://{config.web.host}:{config.web.port}/")
+    try:
+        _run_watch_loop(targets)
+    finally:
+        if web_server is not None:
+            web_server.shutdown()
     print("\nstopped")
     return 0
 

@@ -12,6 +12,7 @@ Parsing of dataset filename timestamps is reused from the VW provider
 from __future__ import annotations
 
 import statistics
+import bisect
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,12 +26,27 @@ NOMINAL_INTERVAL = timedelta(minutes=15)
 # A gap longer than this implies at least one missing value.
 GAP_FACTOR = 1.5
 
-# Slot/gap attribution causes.
+# Slot/gap attribution causes. These codes are the stable machine values
+# (JSON); human-readable labels for the rendered views live in CAUSE_LABELS.
 COMPLETE = "COMPLETE"
 NO_CONTENT = "NO_CONTENT"
 DATA_MISSING = "DATA_MISSING"        # portal up, no value → VW (hard)
 PORTAL_OUTAGE = "PORTAL_OUTAGE"      # portal down → VW (soft)
+DOWNLOAD_FAILED = "DOWNLOAD_FAILED"  # offered but our download failed → our side
 NOT_OBSERVED = "NOT_OBSERVED"        # daemon/our side down → not attributable
+
+CAUSE_LABELS = {
+    COMPLETE: "Geliefert",
+    NO_CONTENT: "Leer geliefert (ohne Daten)",
+    DATA_MISSING: "Nicht geliefert (Portal war erreichbar)",
+    PORTAL_OUTAGE: "Portal nicht erreichbar",
+    DOWNLOAD_FAILED: "Abruf fehlgeschlagen (clientseitig)",
+    NOT_OBSERVED: "Nicht erfasst (kein Messbetrieb)",
+}
+
+
+def cause_label(code: str) -> str:
+    return CAUSE_LABELS.get(code, code)
 
 
 def _parse_ts(iso: str) -> datetime | None:
@@ -112,14 +128,19 @@ class DeliveryDelay:
 class SeriesCompleteness:
     start: datetime | None = None
     end: datetime | None = None
-    expected: int = 0
+    expected: int = 0           # covered + attributable missing (excl. NOT_OBSERVED)
     delivered: int = 0          # distinct windows with content
     no_content: int = 0
+    not_observed: int = 0       # missing while the daemon wasn't watching
     gaps: list[Gap] = field(default_factory=list)
     delays: list[DeliveryDelay] = field(default_factory=list)
+    cause_counts: dict[str, int] = field(default_factory=dict)  # per-slot
 
     @property
     def completeness_pct(self) -> float:
+        # Over windows VW should have delivered *while we were watching*;
+        # NOT_OBSERVED windows (our downtime) are excluded — they are not
+        # attributable to VW.
         if not self.expected:
             return 0.0
         return 100.0 * (self.delivered + self.no_content) / self.expected
@@ -332,14 +353,17 @@ def _series_completeness(
     series.no_content = sum(1 for w in windows if is_no_content[w[1]])
 
     series.delays = _delivery_delays(events, obs_start)
-    series.gaps = _attribute_gaps(windows, events, observation_end)
+    series.gaps, series.cause_counts = _analyse_gaps(windows, events, observation_end)
 
-    # Expected = what was actually covered plus the values the gap analysis
-    # found missing. This is robust to VW's cadence jitter (a normal ~15-min
-    # interval is never counted as a gap), unlike a rigid grid from StartDate.
+    # Expected = covered plus the *attributable* missing values. Attribution
+    # is per 15-min slot (not per gap), so a week of daemon downtime is
+    # counted as NOT_OBSERVED — excluded from the denominator and reported
+    # separately, because we cannot blame VW for windows we weren't watching.
     covered = series.delivered + series.no_content
-    missing = sum(g.estimated_missing for g in series.gaps)
-    series.expected = covered + missing
+    series.not_observed = series.cause_counts.get(NOT_OBSERVED, 0)
+    attributable_missing = sum(
+        v for k, v in series.cause_counts.items() if k != NOT_OBSERVED)
+    series.expected = covered + attributable_missing
     return series
 
 
@@ -372,6 +396,11 @@ def _delivery_delays(
             if name and ts and name not in downloaded_at:
                 downloaded_at[name] = ts
 
+    # Only trust a delay if we were actively polling right after the data
+    # moment; otherwise our own downtime (between the data window and when
+    # we next ran) would masquerade as VW being late.
+    poll_times = [t for t, _ in _poll_samples(events)]
+
     delays: list[DeliveryDelay] = []
     for name, got_at in downloaded_at.items():
         try:
@@ -379,6 +408,8 @@ def _delivery_delays(
         except ValueError:
             continue
         if obs_start is not None and measured < obs_start:
+            continue
+        if not _polled_within(poll_times, measured, measured + 2 * NOMINAL_INTERVAL):
             continue
         published = created_on.get(name)
         publish_lag = (published - measured).total_seconds() if published else 0.0
@@ -396,6 +427,11 @@ def _delivery_delays(
     return delays
 
 
+def _polled_within(poll_times: list[datetime], t0: datetime, t1: datetime) -> bool:
+    i = bisect.bisect_left(poll_times, t0)
+    return i < len(poll_times) and poll_times[i] <= t1
+
+
 def _outage_between(t0: datetime, t1: datetime, events: list[Event]) -> bool:
     for e in events:
         if e.type != "portal_response":
@@ -409,45 +445,62 @@ def _outage_between(t0: datetime, t1: datetime, events: list[Event]) -> bool:
     return False
 
 
-def _attribute_gaps(
-    windows: list, events: list[Event], observation_end: datetime | None = None
-) -> list[Gap]:
-    gaps: list[Gap] = []
-    threshold = NOMINAL_INTERVAL * GAP_FACTOR
-    for (t0, _, _), (t1, _, _) in zip(windows, windows[1:]):
-        if t1 - t0 <= threshold:
-            continue
-        estimated = max(round((t1 - t0) / NOMINAL_INTERVAL) - 1, 1)
-        gaps.append(Gap(t0, t1, estimated, _cause_during(t0, t1, events)))
-
-    # Trailing gap: from the last delivered value to "now" (observation end).
-    # A long quiet tail means values are missing right up to the present.
-    if windows and observation_end is not None:
-        last = windows[-1][0]
-        if observation_end - last > threshold:
-            estimated = max(round((observation_end - last) / NOMINAL_INTERVAL) - 1, 1)
-            gaps.append(Gap(last, observation_end, estimated,
-                            _cause_during(last, observation_end, events)))
-    return gaps
-
-
-def _cause_during(t0: datetime, t1: datetime, events: list[Event]) -> str:
-    """Why was there no value between two delivered windows?"""
-    observed = False
-    portal_reached = False
+def _poll_samples(events: list[Event]) -> list[tuple[datetime, bool]]:
+    """Sorted (timestamp, portal_reachable) for every poll attempt."""
+    samples = []
     for e in events:
         if e.type != "portal_response":
             continue
         ts = _parse_ts(e.ts)
-        if ts is None or not (t0 < ts < t1):
+        if ts is None:
             continue
-        observed = True
         status = e.data.get("status")
-        if isinstance(status, int) and status < 500:
-            portal_reached = True
-    if not observed:
-        return NOT_OBSERVED
-    return DATA_MISSING if portal_reached else PORTAL_OUTAGE
+        samples.append((ts, isinstance(status, int) and status < 500))
+    samples.sort()
+    return samples
+
+
+def _analyse_gaps(
+    windows: list, events: list[Event], observation_end: datetime | None = None
+) -> tuple[list[Gap], dict[str, int]]:
+    """Attribute every missing 15-min slot to a cause.
+
+    Per slot (not per gap): a multi-day gap that contains only a handful
+    of polls is mostly NOT_OBSERVED, not VW's fault. For each missing slot
+    we look for polls within ±½ interval.
+    """
+    samples = _poll_samples(events)
+    times = [s[0] for s in samples]
+    half = NOMINAL_INTERVAL / 2
+
+    def cause_at(slot: datetime) -> str:
+        lo = bisect.bisect_left(times, slot - half)
+        hi = bisect.bisect_right(times, slot + half)
+        if lo == hi:
+            return NOT_OBSERVED
+        return DATA_MISSING if any(samples[i][1] for i in range(lo, hi)) else PORTAL_OUTAGE
+
+    gaps: list[Gap] = []
+    counts: dict[str, int] = {}
+    threshold = NOMINAL_INTERVAL * GAP_FACTOR
+
+    def add_gap(t0: datetime, t1: datetime) -> None:
+        missing = max(round((t1 - t0) / NOMINAL_INTERVAL) - 1, 1)
+        slot_causes = [cause_at(t0 + NOMINAL_INTERVAL * k) for k in range(1, missing + 1)]
+        for cause in slot_causes:
+            counts[cause] = counts.get(cause, 0) + 1
+        dominant = max(set(slot_causes), key=slot_causes.count)
+        gaps.append(Gap(t0, t1, missing, dominant))
+
+    for (t0, _, _), (t1, _, _) in zip(windows, windows[1:]):
+        if t1 - t0 > threshold:
+            add_gap(t0, t1)
+    # Trailing gap: last delivered value to "now" (observation end).
+    if windows and observation_end is not None:
+        last = windows[-1][0]
+        if observation_end - last > threshold:
+            add_gap(last, observation_end)
+    return gaps, counts
 
 
 # -- rendering --------------------------------------------------------------
@@ -481,6 +534,7 @@ def to_dict(r: Report) -> dict:
             "start": _iso(r.series.start), "end": _iso(r.series.end),
             "expected": r.series.expected, "delivered": r.series.delivered,
             "no_content": r.series.no_content,
+            "not_observed": r.series.not_observed,
             "completeness_pct": round(r.series.completeness_pct, 2),
             "delay_measured_count": len(r.series.delays),
             "median_end_to_end_delay_seconds": _round_opt(r.series.median_delay_seconds),
@@ -519,23 +573,25 @@ def render_markdown(r: Report) -> str:
 
     lines += [
         "",
-        "## ZIP-Verfügbarkeit",
-        f"- Angeboten: {r.zips.offered}",
-        f"- Geholt (mit Daten): {r.zips.retrieved}",
-        f"- Leer-Fenster (no_content): {r.zips.no_content}",
-        f"- Angeboten, aber nicht lokal: {len(r.zips.missing)}",
+        "## Datenpaket-Verfügbarkeit",
+        f"- Bereitgestellt: {r.zips.offered}",
+        f"- Abgerufen (mit Daten): {r.zips.retrieved}",
+        f"- Leer (ohne Daten): {r.zips.no_content}",
+        f"- Bereitgestellt, aber nicht lokal: {len(r.zips.missing)}",
         f"- Verfügbarkeit: **{r.zips.availability_pct:.1f} %**",
         "",
-        "## Reihen-Vollständigkeit",
+        "## Datenvollständigkeit",
         f"- Reihe: {_fmt(s.start)} – {_fmt(s.end)}",
         f"- Erwartet (geliefert + erkannte Lücken): {s.expected}",
         f"- Geliefert (mit Daten): {s.delivered}",
-        f"- Leer-Fenster: {s.no_content}",
-        f"- Vollständigkeit: **{s.completeness_pct:.1f} %**",
+        f"- Leer geliefert: {s.no_content}",
+        f"- Vollständigkeit: **{s.completeness_pct:.1f} %** "
+        f"(während Beobachtung; {s.not_observed} nicht erfasste Fenster, "
+        f"separat ausgewiesen)",
     ]
     if s.delays:
         lines.append(
-            f"- Verzögerung bei mir (Datenmoment → abrufbar), {len(s.delays)} Werte: "
+            f"- Bereitstellungsverzögerung, {len(s.delays)} Werte: "
             f"Median {s.median_delay_seconds/60:.1f} min, Max {s.max_delay_seconds/60:.1f} min"
         )
         if s.median_publish_lag_seconds is not None:
@@ -547,27 +603,106 @@ def render_markdown(r: Report) -> str:
             f"  - durch Portal-Ausfall verzögerte Werte: {s.outage_delayed_count}"
         )
     else:
-        lines.append("- Verzögerung: noch keine Werte im Beobachtungsfenster geliefert")
+        lines.append("- Bereitstellungsverzögerung: noch keine Werte im Beobachtungsfenster")
     lines.append(f"- Lücken: {len(s.gaps)}")
     for g in s.gaps:
         lines.append(
             f"  - {_fmt(g.after)} → {_fmt(g.before)} ({g.minutes:.0f} min, "
-            f"~{g.estimated_missing} fehlend) — **{g.cause}**"
+            f"~{g.estimated_missing} fehlend) — **{cause_label(g.cause)}**"
         )
 
-    causes = _gap_cause_summary(s.gaps)
-    if causes:
-        lines += ["", "### Zurechenbarkeit der Lücken"]
-        for cause, count in causes.items():
-            lines.append(f"- {cause}: {count} fehlende Werte")
+    if s.cause_counts:
+        lines += ["", "### Zurechenbarkeit der fehlenden Werte"]
+        for cause, count in sorted(s.cause_counts.items()):
+            lines.append(f"- {cause_label(cause)}: {count}")
     return "\n".join(lines) + "\n"
 
 
-def _gap_cause_summary(gaps: list[Gap]) -> dict[str, int]:
-    summary: dict[str, int] = {}
-    for g in gaps:
-        summary[g.cause] = summary.get(g.cause, 0) + g.estimated_missing
-    return summary
+_HTML_STYLE = """
+:root { font-family: system-ui, sans-serif; line-height: 1.5; }
+body { max-width: 56rem; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+h1 { margin-bottom: 0; }
+.sub { color: #666; margin-top: .25rem; }
+section { margin: 1.5rem 0; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #eee; }
+.big { font-size: 1.6rem; font-weight: 700; }
+.good { color: #1a7f37; } .warn { color: #bf8700; } .bad { color: #cf222e; }
+.muted { color: #888; } a { color: #0969da; }
+""".strip()
+
+
+def _pct_class(pct: float) -> str:
+    return "good" if pct >= 99 else "warn" if pct >= 90 else "bad"
+
+
+def render_html(r: Report) -> str:
+    """Public statistics page for one account — aggregate only, no VIN."""
+    import html
+
+    s = r.series
+    av_cls = _pct_class(r.overall_availability_pct)
+    comp_cls = _pct_class(s.completeness_pct)
+    out: list[str] = [
+        "<!doctype html><html lang=de><head><meta charset=utf-8>",
+        "<meta name=viewport content='width=device-width, initial-scale=1'>",
+        f"<title>Data-Act-Bericht — {html.escape(r.account)}</title>",
+        f"<style>{_HTML_STYLE}</style></head><body>",
+        f"<h1>Data-Act-Bericht — {html.escape(r.account)}</h1>",
+        f"<p class=sub>Beobachtungszeitraum {_fmt(r.observation_start)} – "
+        f"{_fmt(r.observation_end)} ({_local_tzname()})</p>",
+
+        "<section><h2>Portal-Verfügbarkeit</h2>",
+        f"<p class='big {av_cls}'>{r.overall_availability_pct:.1f} %</p>",
+        "<table><tr><th>Endpunkt</th><th>Verfügbar</th><th>OK</th>"
+        "<th>5xx</th><th>Netzfehler</th></tr>",
+    ]
+    for name, e in sorted(r.endpoints.items()):
+        out.append(
+            f"<tr><td>{html.escape(name)}</td>"
+            f"<td class='{_pct_class(e.availability_pct)}'>{e.availability_pct:.1f} %</td>"
+            f"<td>{e.ok}/{e.attempts}</td><td>{e.server_error}</td>"
+            f"<td>{e.network_error}</td></tr>"
+        )
+    out.append("</table>")
+    if r.outages:
+        out.append(f"<p>Ausfallfenster: {len(r.outages)}</p><ul>")
+        for o in r.outages:
+            out.append(f"<li>{html.escape(o.endpoint)}: {_fmt(o.start)} – "
+                       f"{_fmt(o.end)} ({o.minutes:.0f} min)</li>")
+        out.append("</ul>")
+    out.append("</section>")
+
+    out += [
+        "<section><h2>Datenpaket-Verfügbarkeit</h2>",
+        f"<p class='big {_pct_class(r.zips.availability_pct)}'>"
+        f"{r.zips.availability_pct:.1f} %</p>",
+        f"<p>Bereitgestellt {r.zips.offered} · abgerufen {r.zips.retrieved} · "
+        f"leer {r.zips.no_content} · fehlt {len(r.zips.missing)}</p></section>",
+
+        "<section><h2>Datenvollständigkeit</h2>",
+        f"<p class='big {comp_cls}'>{s.completeness_pct:.1f} %</p>",
+        f"<p>Erwartet {s.expected} · geliefert {s.delivered} · "
+        f"leer {s.no_content}</p>",
+        f"<p class=muted>{s.not_observed} nicht erfasste Fenster "
+        f"(kein Messbetrieb, nicht VW zugerechnet)</p>" if s.not_observed else "",
+    ]
+    if s.delays:
+        delay = f"Median {s.median_delay_seconds/60:.1f} min, Max {s.max_delay_seconds/60:.1f} min"
+        out.append(f"<p>Bereitstellungsverzögerung ({len(s.delays)} Werte): {delay}; "
+                   f"durch Portal-Ausfall verzögert: {s.outage_delayed_count}</p>")
+    if s.cause_counts:
+        out.append("<p>Fehlende Werte nach Ursache:</p><ul>")
+        for cause, count in sorted(s.cause_counts.items()):
+            out.append(f"<li>{html.escape(cause_label(cause))}: {count}</li>")
+        out.append("</ul>")
+    else:
+        out.append("<p class=muted>keine Lücken</p>")
+    out.append("</section>")
+
+    out.append("<p class=sub><a href='./'>&larr; Übersicht</a></p>")
+    out.append("</body></html>")
+    return "".join(out)
 
 
 def _iso(dt: datetime | None) -> str | None:

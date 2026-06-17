@@ -71,10 +71,21 @@ class StorageConfig(BaseModel):
         return dict(self.model_extra or {})
 
 
+class WebConfig(BaseModel):
+    """Public statistics web server (served in ``serve`` mode)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    host: str = "0.0.0.0"
+    port: int = 8080
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
     providers: list[ProviderConfig] = Field(default_factory=list)
 
     def provider(self, name: str) -> ProviderConfig:
