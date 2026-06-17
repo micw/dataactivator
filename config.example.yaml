@@ -1,0 +1,11 @@
+
+storage:
+  type: file
+  folder: data       # datasets + event log live under <folder>/<provider>/
+
+providers:
+  - name: vw
+    type: volkswagen-data-act-portal
+    email: user@example.com
+    password: s3cr3t!
+    # poll_interval: 60   # seconds between watch polls (default 60)
