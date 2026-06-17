@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from .core.config import AppConfig, ConfigError, ProviderConfig, YamlConfigBackend
 from .core.events import JsonlEventSink, read_events
+from .core.locks import FileLock, account_lock
 from .core.reporting import build_report, render_markdown, to_dict
 from .core.scheduler import PollTarget, Scheduler
 from .core.sessions import SessionStore
@@ -35,7 +36,16 @@ def main(argv: list[str] | None = None) -> int:
         "-v", "--verbose", action="store_true",
         help="enable debug logging (login steps, redirects)",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    # No subcommand defaults to "serve" (the container entrypoint).
+    sub = parser.add_subparsers(dest="command", required=False)
+
+    sub.add_parser(
+        "serve",
+        help="long-running daemon: watch all providers (container entrypoint)",
+        description="Watches every provider in the config at its poll "
+        "interval and records observations. This is the default when no "
+        "subcommand is given. A web server will be added to this mode.",
+    )
 
     p_login = sub.add_parser(
         "login",
@@ -107,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = YamlConfigBackend(args.config).load()
+        if args.command in (None, "serve"):
+            return _cmd_serve(config)
         if args.command == "login":
             return _cmd_login(config, args.provider, force=args.force)
         if args.command == "fetch":
@@ -154,22 +166,33 @@ def _cmd_fetch(config: AppConfig, name: str) -> int:
     store = SessionStore(config.storage.folder)
     target_root = config.storage.folder.expanduser() / name
 
-    with JsonlEventSink(_event_log_path(config, name)) as sink:
-        client = _build_client(provider, observer=make_observer(sink, name))
-        with client:
-            _ensure_session(client, store, name)
-            try:
-                result = poll_cycle(client, name, target_root, sink)
-            except VwAuthError:
-                # Session died mid-cycle: re-login once and retry the cycle.
-                client.login()
-                store.save(name, client.cookies)
-                result = poll_cycle(client, name, target_root, sink)
-            except VwApiError as exc:
-                print(f"portal unavailable: {exc}")
-                print("the portal answers HTTP 500 in waves — run fetch "
-                      "again later, it resumes where it left off")
-                return 1
+    # Refuse to write the same account's event log concurrently with a
+    # running serve/watch (or another fetch).
+    lock = account_lock(config.storage.folder, name)
+    if not lock.acquire():
+        print(f"error: {name!r} is locked by another instance "
+              f"(serve/watch/fetch already running)", file=sys.stderr)
+        return 1
+
+    try:
+        with JsonlEventSink(_event_log_path(config, name)) as sink:
+            client = _build_client(provider, observer=make_observer(sink, name))
+            with client:
+                _ensure_session(client, store, name)
+                try:
+                    result = poll_cycle(client, name, target_root, sink)
+                except VwAuthError:
+                    # Session died mid-cycle: re-login once and retry.
+                    client.login()
+                    store.save(name, client.cookies)
+                    result = poll_cycle(client, name, target_root, sink)
+                except VwApiError as exc:
+                    print(f"portal unavailable: {exc}")
+                    print("the portal answers HTTP 500 in waves — run fetch "
+                          "again later, it resumes where it left off")
+                    return 1
+    finally:
+        lock.release()
 
     print(f"done: {result.downloaded} downloaded, {result.no_content} empty-window "
           f"markers, {result.skipped} already present, {result.failed} failed")
@@ -184,6 +207,7 @@ class _WatchTarget:
     sink: JsonlEventSink
     store: SessionStore
     target_root: Path
+    lock: FileLock
 
     def run_cycle(self) -> None:
         # Errors during a cycle are recorded (portal_response events come
@@ -202,15 +226,17 @@ class _WatchTarget:
             self.sink.emit("cycle_error", self.name, reason=str(exc))
 
 
-def _cmd_watch(config: AppConfig, names: list[str]) -> int:
-    if not names:
-        names = [p.name for p in config.providers]
-    if not names:
-        print("no providers configured")
-        return 1
-
+def _build_watch_targets(config: AppConfig, names: list[str]) -> list[_WatchTarget]:
     targets: list[_WatchTarget] = []
     for name in names:
+        # Take the account lock first: another instance (a second serve, or
+        # a fetch) holding it must not be joined — that would corrupt the
+        # shared event log. A locked account is skipped, so multiple
+        # instances can each grab a disjoint set.
+        lock = account_lock(config.storage.folder, name)
+        if not lock.acquire():
+            print(f"skipping {name!r}: already locked by another instance")
+            continue
         provider = config.provider(name)
         sink = JsonlEventSink(_event_log_path(config, name))
         client = _build_client(provider, observer=make_observer(sink, name))
@@ -223,18 +249,22 @@ def _cmd_watch(config: AppConfig, names: list[str]) -> int:
             client.cookies.update(cookies)
         targets.append(_WatchTarget(
             name, client, sink, store,
-            config.storage.folder.expanduser() / name,
+            config.storage.folder.expanduser() / name, lock,
         ))
+    return targets
 
+
+def _run_watch_loop(targets: list[_WatchTarget]) -> None:
+    """Drive the poll targets until a stop signal; the blocking core of
+    both ``watch`` and ``serve``. The scheduler owns the main thread and
+    handles SIGINT/SIGTERM, so a web server (serve mode) runs alongside
+    it in a background thread."""
     poll_targets = [
         PollTarget(t.name, t.client.settings.poll_interval, t.run_cycle)
         for t in targets
     ]
-    interval = poll_targets[0].interval if poll_targets else 60
-    print(f"watching {', '.join(names)} every {interval:.0f}s — Ctrl-C to stop")
     for t in targets:
         t.sink.emit("daemon_start", t.name)
-
     scheduler = Scheduler(poll_targets)
     try:
         scheduler.run_forever()
@@ -243,6 +273,45 @@ def _cmd_watch(config: AppConfig, names: list[str]) -> int:
             t.sink.emit("daemon_stop", t.name, reason="signal")
             t.sink.close()
             t.client.close()
+            t.lock.release()
+
+
+def _cmd_watch(config: AppConfig, names: list[str]) -> int:
+    if not names:
+        names = [p.name for p in config.providers]
+    if not names:
+        print("no providers configured")
+        return 1
+    targets = _build_watch_targets(config, names)
+    if not targets:
+        print("nothing to watch (all requested accounts are locked elsewhere)")
+        return 1
+    interval = targets[0].client.settings.poll_interval
+    print(f"watching {', '.join(t.name for t in targets)} "
+          f"every {interval:.0f}s — Ctrl-C to stop")
+    _run_watch_loop(targets)
+    print("\nstopped")
+    return 0
+
+
+def _cmd_serve(config: AppConfig) -> int:
+    """Long-running daemon mode: watch every configured provider. This is
+    the container entrypoint. A web server will be added here later,
+    started in a background thread before the (blocking) watch loop."""
+    names = [p.name for p in config.providers]
+    if not names:
+        print("no providers configured")
+        return 1
+    targets = _build_watch_targets(config, names)
+    if not targets:
+        print("nothing to serve (all accounts are locked by other instances)")
+        return 1
+    interval = targets[0].client.settings.poll_interval
+    print(f"serving: watching {len(targets)} provider(s) "
+          f"({', '.join(t.name for t in targets)}) every {interval:.0f}s")
+    # TODO: start web server thread here (health, metrics, report) before
+    # entering the blocking loop.
+    _run_watch_loop(targets)
     print("\nstopped")
     return 0
 

@@ -15,15 +15,19 @@ FROM python:3.12-slim
 COPY --from=build /dist/*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
 
-# Unprivileged user; data and config live under the mounted working dir.
-RUN useradd --create-home --uid 1000 app
-WORKDIR /app
-RUN chown app:app /app
+# Unprivileged user. Two mounts at runtime:
+#   /config  -> the config file (Secret; it holds credentials) at /config/config.yaml
+#   /data    -> a PersistentVolume for the event log, datasets and sessions;
+#               set `storage.folder: /data` in the config.
+RUN useradd --create-home --uid 10001 app \
+    && mkdir -p /data /config \
+    && chown -R app:app /data
+WORKDIR /data
 USER app
 
-# config.yaml and data/ are expected to be mounted here at runtime, e.g.
-#   docker run -v ./config.yaml:/app/config.yaml -v ./data:/app/data ...
-VOLUME ["/app/data"]
+VOLUME ["/data"]
 
+# Default command: serve (watch all configured providers) with the config
+# mounted at /config/config.yaml. Override args in the pod spec if needed.
 ENTRYPOINT ["dataactivator"]
-CMD ["watch"]
+CMD ["-c", "/config/config.yaml", "serve"]
