@@ -25,6 +25,8 @@ from .events import Event
 NOMINAL_INTERVAL = timedelta(minutes=15)
 # A gap longer than this implies at least one missing value.
 GAP_FACTOR = 1.5
+# Data is considered "current" if captured no longer ago than this when published.
+FRESH_MAX_AGE = timedelta(minutes=30)
 
 # Slot/gap attribution causes. These codes are the stable machine values
 # (JSON); human-readable labels for the rendered views live in CAUSE_LABELS.
@@ -192,6 +194,15 @@ class Freshness:
     @property
     def max_lag_seconds(self) -> float | None:
         return max(self.capture_lags_seconds) if self.capture_lags_seconds else None
+
+    @property
+    def current_pct(self) -> float:
+        """Share of datasets whose data was current (≤ FRESH_MAX_AGE) at publish."""
+        if not self.capture_lags_seconds:
+            return 0.0
+        fresh = sum(1 for lag in self.capture_lags_seconds
+                    if lag <= FRESH_MAX_AGE.total_seconds())
+        return 100.0 * fresh / len(self.capture_lags_seconds)
 
 
 @dataclass
@@ -626,6 +637,8 @@ def to_dict(r: Report) -> dict:
         },
         "freshness": {
             "datasets_total": r.freshness.datasets_total,
+            "current_pct": round(r.freshness.current_pct, 2),
+            "current_threshold_minutes": int(FRESH_MAX_AGE.total_seconds() / 60),
             "median_capture_lag_seconds": _round_opt(r.freshness.median_lag_seconds),
             "max_capture_lag_seconds": _round_opt(r.freshness.max_lag_seconds),
             "frozen_spans": r.freshness.frozen_spans,
@@ -672,6 +685,7 @@ def render_markdown(r: Report) -> str:
         f"- Vollständigkeit: **{s.completeness_pct:.1f} %** "
         f"(während Beobachtung; {s.not_observed} nicht erfasste Fenster, "
         f"separat ausgewiesen)",
+        f"- Aktualität (Daten ≤ 30 min alt): **{r.freshness.current_pct:.1f} %**",
     ]
     if s.delays:
         lines.append(
@@ -786,6 +800,9 @@ def render_html(r: Report) -> str:
         f"leer {s.no_content}</p>",
         f"<p class=muted>{s.not_observed} nicht erfasste Fenster "
         f"(kein Messbetrieb, nicht VW zugerechnet)</p>" if s.not_observed else "",
+        f"<p>Aktualität (Daten ≤ 30 min alt): "
+        f"<b class='{_pct_class(r.freshness.current_pct)}'>"
+        f"{r.freshness.current_pct:.1f} %</b></p>",
     ]
     if s.delays:
         delay = f"Median {s.median_delay_seconds/60:.1f} min, Max {s.max_delay_seconds/60:.1f} min"

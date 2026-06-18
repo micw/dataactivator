@@ -69,3 +69,17 @@ def test_freshness_lag_and_frozen_span(tmp_path: Path) -> None:
     # one frozen stretch 09:30 -> 10:30 = 60 min
     assert fr.frozen_spans == 1
     assert round(fr.longest_frozen_seconds / 60) == 60
+
+
+def test_current_pct(tmp_path: Path) -> None:
+    vin_dir = tmp_path / VIN
+    # Two datasets ≤30 min old, two older -> 50% current.
+    for publish, captured in [
+        ("20260617100000", "2026-06-17T09:50:00Z"),   # 10 min -> current
+        ("20260617101500", "2026-06-17T10:10:00Z"),   # 5 min  -> current
+        ("20260617103000", "2026-06-17T08:00:00Z"),   # 150 min -> stale
+        ("20260617104500", "2026-06-17T07:00:00Z"),   # 225 min -> stale
+    ]:
+        write_dataset(vin_dir, publish, [pt("car_captured_time", captured)])
+    fr = build_report("acc", [], data_root=tmp_path).freshness
+    assert fr.current_pct == 50.0
